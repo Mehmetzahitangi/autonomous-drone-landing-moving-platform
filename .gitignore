@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+
+# Deney takip / loglar
+wandb/
+runs/
+reports/tb/
+reports/sac_eval/
+
+# Model / checkpoint ikilileri (kod deposuna konmaz; istenirse GitHub Release olarak eklenir)
+*.pth
+*.ckpt
+*.zip
+*.pkl
+reports/*.mp4
+
+# Üçüncü parti doküman (6.5 MB, repoya gerekmez)
+pybullet_quickstartguide.pdf
+
+# gym-pybullet-drones örnek uçuş çıktıları (bize ait değil)
+results/
+
+# Testler (şimdilik paylaşılmıyor)
+scripts/
+
+# Dahili çalışma notları (README hariç paylaşılmaz)
+CALISMA_PLANI.md
+KURULUM_ve_GORSELLESTIRME.md
+VIZYON_ve_UCTAN_UCA_GOREV.md
+ACIK_NOTLAR_TODO.md
+Proje hakkında.md
+RL in etkisi ve her fazda ne yapılıyor görev dağılımı.md
+
+.DS_Store

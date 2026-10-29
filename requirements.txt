@@ -1,0 +1,17 @@
+# RL
+stable-baselines3[extra]
+sb3-contrib
+gymnasium
+# Bilim / araçlar
+numpy
+scipy
+matplotlib
+pandas
+filterpy            # KF / EKF / IMM
+opencv-contrib-python   # ArUco
+wandb
+
+# NOT: gym-pybullet-drones GitHub'dan kurulur (editable değil; kaynak klasörü gerekmez, silinebilir):
+#   pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git
+# NOT: torch'u BURADAN kurma — RTX 5070 Ti için cu130 index'inden ayrı kur:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
