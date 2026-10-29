@@ -7,7 +7,8 @@ Dron'un hareket hâlindeki bir platforma (gemi güvertesi / araç / USV) yumuşa
 - ✅ **Faz 1** — Hareketli platform ortamı (gym-pybullet-drones üstüne) + IMM-EKF göreli durum kestirimi
 - ✅ **Faz 2** — ZEM/ZEV + PD klasik güdüm tabanı (doğrulanmış iniş)
 - ✅ **Faz 3 (düz SAC)** — Hareketli platforma **%100 otonom yumuşak iniş** (10/10 değerlendirme, temas hızı < 0.5 m/s, nazik uçuş; tilt 0.08–0.17 rad)
-- ⏳ **Sıradaki** — IMM-EKF'i kapalı çevrime almak (ground-truth yerine **kestirilen** platform durumu), ardından residual RL → CBF güvenlik → görsel (ArUco) → PX4 SITL
+- ✅ **Faz 4-A (IMM-EKF kapalı çevrim / POMDP)** — Gözlem ground-truth yerine **kestirilen** platform durumu; gürültülü kestirimle (`meas_std=0.03`) yine **10/10 iniş**, konum kestirim RMSE'si **0.022 m** (eşik 0.3 m'nin çok altında)
+- ⏳ **Sıradaki** — residual RL (ZEM/ZEV tabanı + SAC artık politika) → zorlaştırma/curriculum → CBF güvenlik → görsel (ArUco) → PX4 SITL
 
 > RL'in rolü **güdüm** katmanı: nereye nişan alınacağını öğrenir. Alçak seviye kontrol DSL-PID'de,
 > platform durumu kestirimi IMM-EKF'te kalır (GNC katmanlaması).

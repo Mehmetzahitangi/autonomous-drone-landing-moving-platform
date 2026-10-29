@@ -4,6 +4,7 @@ from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics, ActionType, ObservationType
 import pybullet as p
 from gymnasium import spaces
+from estimation.imm_ekf import PlatformIMM
 
 class LandingAviary(BaseRLAviary):
     """LandingAviary
@@ -66,6 +67,9 @@ class LandingAviary(BaseRLAviary):
         self.plat_freq  = 0.3                    # Hz   (dalga frekansı)
 
         self.ACT_SCALE = 0.1   # adım başına +- 0.1 m hedef offset → 9° eğim (nazik). Yavaş kalırsa 0.2'ye çıkar.
+
+        self.meas_std = 0.03        # sensör ölçüm gürültüsü std(m), ArUco/görsel deki gibi
+        self.use_estimator = True   # True: obs'de kestirim kullanır, gerçekçi. False: eski ground-truth A/B testi için kullanılabilir
 
         super().__init__(drone_model=drone_model,
                          num_drones=1,
@@ -194,15 +198,36 @@ class LandingAviary(BaseRLAviary):
             
         return False
 
+    def _relative_state_est(self):
+
+        s = self._getDroneStateVector(0)
+        drone_pos, drone_vel = s[0:3], s[10:13]
+        t = self.step_counter / self.PYB_FREQ
+
+        # gerçek platform (x,y) + ölçüm gürültüsü = sensör ölçümü
+        plat_x = self.plat_drift[0] * t
+        plat_y = self.plat_amp * np.sin(2*np.pi*self.plat_freq*t)
+
+        z = np.array([plat_x, plat_y]) + np.random.normal(0, self.meas_std, 2)
+
+        x_est, _ = self._imm.step(z)                       # [px, vx, py, vy]
+        x_est = np.ravel(x_est)                            # filterpy (4,1) kolon vektörü → (4,)
+        plat_pos_est = np.array([x_est[0], x_est[2], self.PLATFORM_TOP])
+        plat_vel_est = np.array([x_est[1], x_est[3], 0.0])
+        return plat_pos_est - drone_pos, plat_vel_est - drone_vel
+
     def reset(self, seed=None, options=None):
         x0, y0 = np.random.uniform(-0.5, 0.5, size=2)
         z0 = np.random.uniform(0.6, 1.0)
         self.INIT_XYZS = np.array([[x0, y0, z0]])   
         
 
+        # IMM-EKF  (dt = kontrol periyodu)
+        self._imm = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
+    
         obs = super().reset(seed=seed, options=options)
-        r_rel, _ = self._relative_state()
-        self.prev_dist = np.linalg.norm(r_rel)
+        r_rel, _ = self._relative_state()       # prev_dist GERÇEK durumdan
+        self.prev_dist = np.linalg.norm(r_rel) 
         return obs
     
     def step(self, action):
@@ -301,12 +326,12 @@ class LandingAviary(BaseRLAviary):
         base_obs = super()._computeObs()
         
         if self.OBS_TYPE == ObservationType.KIN:
-            r_rel, v_rel = self._relative_state()
+            r_rel, v_rel = self._relative_state_est() if self.use_estimator else self._relative_state()
             
-            # Her dron için ek gözlemleri dizi formatına çevir
+            # Her dron için ek gözlemleri dizi formatına çevirir
             extra_obs = np.array([np.hstack([r_rel, v_rel]) for _ in range(self.NUM_DRONES)])
             
-            # Temel gözlemlerle yan yana birleştir
+            # Temel gözlemlerle yan yana birleştirilir
             new_obs = np.hstack([base_obs, extra_obs]).astype(np.float32)
             return new_obs
             
