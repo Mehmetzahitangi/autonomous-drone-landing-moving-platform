@@ -5,6 +5,7 @@ from gym_pybullet_drones.utils.enums import DroneModel, Physics, ActionType, Obs
 import pybullet as p
 from gymnasium import spaces
 from estimation.imm_ekf import PlatformIMM
+from guidance.landing_guidance import LandingGuidance
 
 class LandingAviary(BaseRLAviary):
     """LandingAviary
@@ -70,6 +71,9 @@ class LandingAviary(BaseRLAviary):
 
         self.meas_std = 0.03        # sensör ölçüm gürültüsü std(m), ArUco/görsel deki gibi
         self.use_estimator = True   # True: obs'de kestirim kullanır, gerçekçi. False: eski ground-truth A/B testi için kullanılabilir
+
+        self.RES_SCALE = 0.05
+        self.use_residual = True
 
         super().__init__(drone_model=drone_model,
                          num_drones=1,
@@ -210,13 +214,21 @@ class LandingAviary(BaseRLAviary):
 
         z = np.array([plat_x, plat_y]) + np.random.normal(0, self.meas_std, 2)
 
-        x_est, _ = self._imm.step(z)                       # [px, vx, py, vy]
-        x_est = np.ravel(x_est)                            # filterpy (4,1) kolon vektörü → (4,)
-        plat_pos_est = np.array([x_est[0], x_est[2], self.PLATFORM_TOP])
-        plat_vel_est = np.array([x_est[1], x_est[3], 0.0])
-        return plat_pos_est - drone_pos, plat_vel_est - drone_vel
+        xe = np.ravel(self._imm.step(z)[0])          # [px, vx, py, vy]
+
+        #x_est, _ = self._imm.step(z)                       # [px, vx, py, vy]
+        #x_est = np.ravel(x_est)                            # filterpy (4,1) kolon vektörü → (4,)
+        self.plat_pos_est = np.array([xe[0], xe[2], self.PLATFORM_TOP]) # mutlak kestirimi self'e yazıyoruz, _preprocessAction tabanı bunu okuyacak
+        self.plat_vel_est = np.array([xe[1], xe[3], 0.0])
+        return self.plat_pos_est - drone_pos, self.plat_vel_est - drone_vel
 
     def reset(self, seed=None, options=None):
+
+        self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
+        self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC) #  klasik ZEM/ZEV tabanı
+
+        self._guid.reset_schedule() # # her bölüm: iç zaman + alçalma çizelgesini sıfırla
+        
         x0, y0 = np.random.uniform(-0.5, 0.5, size=2)
         z0 = np.random.uniform(0.6, 1.0)
         self.INIT_XYZS = np.array([[x0, y0, z0]])   
@@ -340,15 +352,47 @@ class LandingAviary(BaseRLAviary):
     def _preprocessAction(self, action):
         """Aksiyonu MUTLAK 1m-sıçrama yerine mevcut konuma GÖRELİ küçük offset olarak uygula.
         Böylece DSL PID nazik eğim komutu üretir, dron takla atmaz. (bkz. N1)"""
+
         self.action_buffer.append(action)
         rpm = np.zeros((self.NUM_DRONES, 4))
+        dt = self.CTRL_TIMESTEP
+        
         for k in range(action.shape[0]):
             state = self._getDroneStateVector(k)
-            target_pos = state[0:3] + self.ACT_SCALE * action[k, :]   # göreli + küçük
+            drone_pos, drone_vel = state[0:3], state[10:13]
+
+            if self.use_residual:
+                # Klasik ZEM/ZEV tabanı — gözlemle aynı kestirimi okur (self._plat_*_est).
+                # Bu cache _relative_state_est her adım günceller, filtreyi BURADA tekrar adımlamıyoruz (yoksa adım başına iki kez adımlanırdı!!!)
+
+                target_base, phase = self._guid.position_command(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, dt)
+                target_pos = target_base + self.RES_SCALE * action[k, :]   # taban + residual, SAC sadece düzeltir
+
+                # landing_diag da residual katkısını ölçmek için
+                self._dbg_phase    = phase
+                self._dbg_base_off = float(np.linalg.norm(target_base - drone_pos))
+                self._dbg_res_off  = float(self.RES_SCALE * np.linalg.norm(action[k, :]))
+            else:
+                target_pos = drone_pos + self.ACT_SCALE * action[k, :]     # eski düz SAC yolu
+
             rpm_k, _, _ = self.ctrl[k].computeControl(
-                control_timestep=self.CTRL_TIMESTEP,
-                cur_pos=state[0:3],  cur_quat=state[3:7],
-                cur_vel=state[10:13], cur_ang_vel=state[13:16],
+                control_timestep=dt,
+                cur_pos=drone_pos,  cur_quat=state[3:7],
+                cur_vel=drone_vel,  cur_ang_vel=state[13:16],
                 target_pos=target_pos)
             rpm[k, :] = rpm_k
         return rpm
+    
+            #target_pos = state[0:3] + self.ACT_SCALE * action[k, :]   # # SAC tüm hedefi veriyor
+            #Residual RL:
+            #target_base, phase = self._guid.position_command(drone_pos, drone_vel, plat_pos_est, plat_vel_est, dt)
+            #target_pos = target_base + self.RES_SCALE * action[k, :]  # SAC sadece düzeltir
+
+
+            #rpm_k, _, _ = self.ctrl[k].computeControl(
+            #    control_timestep=self.CTRL_TIMESTEP,
+            #    cur_pos=state[0:3],  cur_quat=state[3:7],
+            #    cur_vel=state[10:13], cur_ang_vel=state[13:16],
+            #    target_pos=target_pos)
+            #rpm[k, :] = rpm_k
+        #return rpm"""

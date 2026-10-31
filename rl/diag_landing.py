@@ -1,5 +1,5 @@
 """
-diag_landing.py — iniş teşhisi + IMM-EKF kestirim kalitesi (v3).
+diag_landing.py — iniş teşhisi + IMM-EKF kestirim kalitesi + residual katkısı (v4).
 
 Rollout'u HAM LandingAviary üzerinde yapar (VecEnv DEĞİL) → auto-reset yok,
 terminal durumu ve terminated/truncated DOĞRU okunur. VecNormalize yalnız
@@ -7,14 +7,18 @@ obs normalizasyonu için kullanılır.
 
 HER episode için:
   İNİŞ (GERÇEK durumdan — _relative_state):
-    - min h, o andaki horiz/vrel ; min horiz ; min drone_z ; max tilt
-    - başarı kapıları (h<0.05 / horiz<0.3 / ikisi) ; bitiş nedeni
+    - min h, min horiz, min drone_z, max tilt ; başarı kapıları ; bitiş nedeni
   KESTİRİM (IMM-EKF ↔ gerçek platform):
-    - pos_RMSE : platform (x,y) konum kestirim hatası (m)
-    - vel_RMSE : platform (x,y) hız kestirim hatası (m/s)
-    - mu_osc   : ortalama osilasyon-modu olasılığı (y'de salınım → ~1 olmalı)
+    - pos_RMSE / vel_RMSE (m, m/s) ; mu_osc (osilasyon-modu olasılığı)
+  RESIDUAL (yalnız Faz 4-B residual env'inde; yoksa "-"):
+    - base_cm : klasik ZEM/ZEV tabanının ürettiği hedef offset büyüklüğü (cm)
+    - res_cm  : SAC residual'ının eklediği offset büyüklüğü (cm)
+    - res%    : res_cm / base_cm  → SAC tabanı ne kadar düzeltiyor
+    - %TERM   : adımların yüzde kaçı TERMINAL fazda geçti
 
-Amaç: (a) iniş gürültülü kestirimle hâlâ tutuyor mu, (b) filtre ne kadar iyi.
+Residual metrikleri env'in _preprocessAction içinde cache'lediği alanlardan okunur:
+    aviary._dbg_phase, aviary._dbg_base_off, aviary._dbg_res_off
+Bu alanlar yoksa (düz SAC modeli, use_residual=False) residual sütunları "-" basar.
 """
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -39,14 +43,18 @@ model = SAC.load("reports/sac_landing")
 
 # Rollout için HAM env (use_estimator varsayılan True → obs'ta kestirim)
 aviary = LandingAviary(gui=False, act=ACT, obs=ObservationType.KIN)
-print(f"use_estimator = {aviary.use_estimator} | meas_std = {aviary.meas_std} m")
+has_residual = getattr(aviary, "use_residual", False)
+print(f"use_estimator = {aviary.use_estimator} | meas_std = {aviary.meas_std} m | "
+      f"use_residual = {has_residual}")
 
 g1 = g2 = g3 = succ = 0
 all_pos_rmse, all_vel_rmse = [], []
+all_base_cm, all_res_cm, all_resratio, all_term_frac = [], [], [], []
 
 print(f"\n{'ep':>2} | {'min_h':>6} {'min_hz':>6} {'min_z':>6} {'tilt':>5} | "
-      f"{'posRMSE':>7} {'velRMSE':>7} {'mu_osc':>6} | {'ikisi':>5} | bitis")
-print("-" * 92)
+      f"{'posRMSE':>7} {'velRMSE':>7} {'mu_osc':>6} | "
+      f"{'base_cm':>7} {'res_cm':>6} {'res%':>5} {'%TERM':>5} | {'ikisi':>5} | bitis")
+print("-" * 120)
 
 for ep in range(N):
     obs, info = aviary.reset()
@@ -56,6 +64,7 @@ for ep in range(N):
     min_horiz = 1e9; min_z = 1e9; max_tilt = 0.0
     ever_h = ever_horiz = ever_both = False
     pos_sq, vel_sq, mu_osc = [], [], []
+    base_offs, res_offs, term_flags = [], [], []
     s = aviary._getDroneStateVector(0)
 
     while not (term or trunc):
@@ -87,6 +96,12 @@ for ep in range(N):
         vel_sq.append(np.sum((np.array([xe[1], xe[3]]) - platv_true)**2))
         mu_osc.append(float(aviary._imm.imm.mu[1]))   # mod 2 = harmonik/osilasyon
 
+        # --- RESIDUAL katkısı (env cache'lerse) ---
+        if has_residual:
+            base_offs.append(float(getattr(aviary, "_dbg_base_off", np.nan)))
+            res_offs.append(float(getattr(aviary, "_dbg_res_off", np.nan)))
+            term_flags.append(getattr(aviary, "_dbg_phase", "") == "TERMINAL")
+
     is_succ = bool(info.get("is_success"))
     roll, pitch = float(s[7]), float(s[8])
     sz = float(s[2]); sim_t = aviary.step_counter / aviary.PYB_FREQ
@@ -105,14 +120,36 @@ for ep in range(N):
     all_pos_rmse.append(pos_rmse); all_vel_rmse.append(vel_rmse)
     g1 += ever_h; g2 += ever_horiz; g3 += ever_both; succ += is_succ
 
+    # residual özetleri (cm) — yoksa NaN/“-”
+    if has_residual and base_offs:
+        base_cm = 100.0 * np.nanmean(base_offs)
+        res_cm  = 100.0 * np.nanmean(res_offs)
+        resrat  = (res_cm / base_cm) if base_cm > 1e-9 else np.nan
+        termf   = 100.0 * np.mean(term_flags)
+        all_base_cm.append(base_cm); all_res_cm.append(res_cm)
+        all_resratio.append(resrat); all_term_frac.append(termf)
+        base_s = f"{base_cm:7.2f}"; res_s = f"{res_cm:6.2f}"
+        rat_s  = f"{resrat*100:4.0f}%"; term_s = f"{termf:4.0f}%"
+    else:
+        base_s = f"{'-':>7}"; res_s = f"{'-':>6}"; rat_s = f"{'-':>5}"; term_s = f"{'-':>5}"
+
     print(f"{ep:>2} | {min_h:6.3f} {min_horiz:6.3f} {min_z:6.3f} {max_tilt:5.2f} | "
           f"{pos_rmse:7.3f} {vel_rmse:7.3f} {np.mean(mu_osc):6.2f} | "
+          f"{base_s} {res_s} {rat_s} {term_s} | "
           f"{str(ever_both):>5} | {end}")
 
-print("-" * 92)
+print("-" * 120)
 print(f"ÖZET ({N} episode):")
 print(f"  BAŞARI (iniş)          : {succ}/{N}")
 print(f"  İkisi aynı anda (h&hz) : {g3}/{N}")
 print(f"  Ort. konum RMSE        : {np.mean(all_pos_rmse):.3f} m   (eşik horiz<0.3 ile kıyasla)")
 print(f"  Ort. hız RMSE          : {np.mean(all_vel_rmse):.3f} m/s")
+if all_base_cm:
+    print(f"  --- RESIDUAL katkısı ---")
+    print(f"  Ort. taban offset      : {np.mean(all_base_cm):.2f} cm")
+    print(f"  Ort. residual offset   : {np.mean(all_res_cm):.2f} cm")
+    print(f"  Ort. residual/taban    : {np.nanmean(all_resratio)*100:.0f} %   (SAC tabanı ne kadar düzeltiyor)")
+    print(f"  Ort. TERMINAL fazı     : {np.mean(all_term_frac):.0f} %   (adımların)")
+else:
+    print(f"  (residual metrikleri yok — düz SAC modeli / use_residual=False)")
 aviary.close()

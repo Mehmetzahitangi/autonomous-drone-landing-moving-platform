@@ -67,7 +67,10 @@ class LandingGuidance:
         if self._cmd_z is None:
             self._cmd_z = drone_pos[2]
         self._cmd_z = max(self._cmd_z - self.descent_step, contact_z)
-        target = np.array([platform_pos[0], platform_pos[1], self._cmd_z], dtype=float)
+        #target = np.array([platform_pos[0], platform_pos[1], self._cmd_z], dtype=float) Sadece konum
+        lead = self.lookahead   # yaklaşık 0.4 s
+        target_xy = platform_pos[:2] + platform_vel[:2] * lead   # platformun öngörülen hareketine göre, artık gerieden takip etmeyecek
+        target = np.array([target_xy[0], target_xy[1], self._cmd_z])
         return target, "TERMINAL"
 
 
