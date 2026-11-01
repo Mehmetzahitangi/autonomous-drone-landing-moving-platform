@@ -26,6 +26,9 @@ results/
 # Testler (şimdilik paylaşılmıyor)
 scripts/
 
+# Video üreticisi (şimdilik paylaşılmıyor)
+rl/make_video.py
+
 # Dahili çalışma notları (README hariç paylaşılmaz)
 CALISMA_PLANI.md
 KURULUM_ve_GORSELLESTIRME.md

@@ -75,6 +75,10 @@ class LandingAviary(BaseRLAviary):
         self.RES_SCALE = 0.05
         self.use_residual = True
 
+        self.plat_phase=0.0
+        self.plat_x0=0.0
+        self.plat_y0=0.0
+
         super().__init__(drone_model=drone_model,
                          num_drones=1,
                          initial_xyzs=initial_xyzs,
@@ -202,6 +206,17 @@ class LandingAviary(BaseRLAviary):
             
         return False
 
+    def _platform_state(self, t):
+        # Platformun gerçek konum ve hızını tek bir yere toplayıp, döndürür 
+        w = 2*np.pi*self.plat_freq
+        x = self.plat_x0 + self.plat_drift[0]*t
+        y = self.plat_y0 + self.plat_drift[1]*t + self.plat_amp*np.sin(w*t + self.plat_phase)
+        pos = np.array([x, y, self.PLATFORM_TOP])               # z sabit
+        vel = np.array([self.plat_drift[0],
+                        self.plat_drift[1] + self.plat_amp*w*np.cos(w*t + self.plat_phase),
+                        0.0])
+        return pos, vel
+
     def _relative_state_est(self):
 
         s = self._getDroneStateVector(0)
@@ -209,10 +224,8 @@ class LandingAviary(BaseRLAviary):
         t = self.step_counter / self.PYB_FREQ
 
         # gerçek platform (x,y) + ölçüm gürültüsü = sensör ölçümü
-        plat_x = self.plat_drift[0] * t
-        plat_y = self.plat_amp * np.sin(2*np.pi*self.plat_freq*t)
-
-        z = np.array([plat_x, plat_y]) + np.random.normal(0, self.meas_std, 2)
+        plat_pos, _ = self._platform_state(t) 
+        z = plat_pos[0:2] + np.random.normal(0, self.meas_std, 2) # ölçüm = gerçek (x,y) + gürültü
 
         xe = np.ravel(self._imm.step(z)[0])          # [px, vx, py, vy]
 
@@ -223,23 +236,27 @@ class LandingAviary(BaseRLAviary):
         return self.plat_pos_est - drone_pos, self.plat_vel_est - drone_vel
 
     def reset(self, seed=None, options=None):
+        # platform randomizationı (her bölüm farklı yörünge) 
+        self.plat_phase = np.random.uniform(0, 2*np.pi) # Platform artık hep y=0'dan yukarı değil, farklı noktadan sallanmaya başlar
+        self.plat_amp   = np.random.uniform(0.10, 0.30) # salınım genliği (m). Ne kadar geniş sallanıyor (deniz durumu şiddeti)
+        self.plat_freq  = np.random.uniform(0.25, 0.35) # salınım frekansı (Hz). Ne kadar hızlı sallanıyor (deniz durumu periyodu)
+        ang = np.random.uniform(0, 2*np.pi); spd = np.random.uniform(0.0, 0.12)
+        self.plat_drift = np.array([spd*np.cos(ang), spd*np.sin(ang)]) # sabit sürüklenme hızı [vx,vy]. Platformun düz kayması (seyreden gemi). ang+spd ile rastgele yöne.
+        self.plat_x0, self.plat_y0 = 0.0, 0.0
 
-        self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
-        self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC) #  klasik ZEM/ZEV tabanı
-
-        self._guid.reset_schedule() # # her bölüm: iç zaman + alçalma çizelgesini sıfırla
-        
+        # drone başlangıcı 
         x0, y0 = np.random.uniform(-0.5, 0.5, size=2)
         z0 = np.random.uniform(0.6, 1.0)
-        self.INIT_XYZS = np.array([[x0, y0, z0]])   
-        
+        self.INIT_XYZS = np.array([[x0, y0, z0]])
 
-        # IMM-EKF  (dt = kontrol periyodu)
-        self._imm = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
-    
+        # IMM (randomize edilmiş freq ile) + klasik taban, IMM artık doğru (rastgele) freq'i alıyor.
+        self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
+        self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC)
+        self._guid.reset_schedule()
+
         obs = super().reset(seed=seed, options=options)
-        r_rel, _ = self._relative_state()       # prev_dist GERÇEK durumdan
-        self.prev_dist = np.linalg.norm(r_rel) 
+        r_rel, _ = self._relative_state()
+        self.prev_dist = np.linalg.norm(r_rel)
         return obs
     
     def step(self, action):
@@ -283,12 +300,10 @@ class LandingAviary(BaseRLAviary):
 
     def _move_platform(self):
         t = self.step_counter / self.PYB_FREQ            # saniye cinsinden sim zamanı
-        x = self.plat_drift[0] * t
-        y = self.plat_amp * np.sin(2*np.pi*self.plat_freq*t)   # dalga
-        p.resetBasePositionAndOrientation(self.PLATFORM_ID,
-                                        [x, y, 0.05],
-                                        p.getQuaternionFromEuler([0, 0, 0]),
-                                        physicsClientId=self.CLIENT)
+        pos, _ = self._platform_state(t)    
+        p.resetBasePositionAndOrientation(self.PLATFORM_ID, [pos[0], pos[1], 0.05],
+                                            p.getQuaternionFromEuler([0,0,0]),
+                                            physicsClientId=self.CLIENT)
     
     def _computeInfo(self):
         r_rel, v_rel = self._relative_state()
@@ -306,12 +321,7 @@ class LandingAviary(BaseRLAviary):
         s = self._getDroneStateVector(0)
         drone_pos, drone_vel = s[0:3], s[10:13]
         t = self.step_counter / self.PYB_FREQ
-        plat_pos = np.array([self.plat_drift[0]*t,
-                            self.plat_amp*np.sin(2*np.pi*self.plat_freq*t),
-                            self.PLATFORM_TOP])
-        plat_vel = np.array([self.plat_drift[0],
-                            self.plat_amp*2*np.pi*self.plat_freq*np.cos(2*np.pi*self.plat_freq*t),
-                            0.0])
+        plat_pos, plat_vel = self._platform_state(t) 
         return plat_pos - drone_pos, plat_vel - drone_vel   # r_rel, v_rel
 
     def _observationSpace(self):

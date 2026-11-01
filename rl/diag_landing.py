@@ -87,10 +87,9 @@ for ep in range(N):
 
         # --- IMM-EKF kestirim hatası (platform x,y) ---
         t = aviary.step_counter / aviary.PYB_FREQ
-        plat_true  = np.array([aviary.plat_drift[0]*t,
-                               aviary.plat_amp*np.sin(2*np.pi*aviary.plat_freq*t)])
-        platv_true = np.array([aviary.plat_drift[0],
-                               aviary.plat_amp*2*np.pi*aviary.plat_freq*np.cos(2*np.pi*aviary.plat_freq*t)])
+        _pp, _pv = aviary._platform_state(t)       # randomization'a dayanıklı gerçek platform (x,y)
+        plat_true  = _pp[0:2]
+        platv_true = _pv[0:2]
         xe = np.ravel(aviary._imm.imm.x)     # [px, vx, py, vy] (filterpy (4,1) → (4,))
         pos_sq.append(np.sum((np.array([xe[0], xe[2]]) - plat_true)**2))
         vel_sq.append(np.sum((np.array([xe[1], xe[3]]) - platv_true)**2))
