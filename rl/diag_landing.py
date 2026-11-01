@@ -84,15 +84,14 @@ for ep in range(N):
         if h < 0.05: ever_h = True
         if horiz < 0.3: ever_horiz = True
         if h < 0.05 and horiz < 0.3: ever_both = True
+        last_h, last_horiz, last_vrel = h, horiz, vrel   # TERMINAL adim degerleri
 
         # --- IMM-EKF kestirim hatası (platform x,y) ---
         t = aviary.step_counter / aviary.PYB_FREQ
-        _pp, _pv = aviary._platform_state(t)       # randomization'a dayanıklı gerçek platform (x,y)
-        plat_true  = _pp[0:2]
-        platv_true = _pv[0:2]
-        xe = np.ravel(aviary._imm.imm.x)     # [px, vx, py, vy] (filterpy (4,1) → (4,))
-        pos_sq.append(np.sum((np.array([xe[0], xe[2]]) - plat_true)**2))
-        vel_sq.append(np.sum((np.array([xe[1], xe[3]]) - platv_true)**2))
+        plat_true, platv_true = aviary._platform_state(t)   # 3B gerçek platform (x,y,z) — heave dahil
+        xe = np.ravel(aviary._imm.imm.x)     # [px,vx,py,vy,pz,vz]
+        pos_sq.append(np.sum((np.array([xe[0], xe[2], xe[4]]) - plat_true)**2))
+        vel_sq.append(np.sum((np.array([xe[1], xe[3], xe[5]]) - platv_true)**2))
         mu_osc.append(float(aviary._imm.imm.mu[1]))   # mod 2 = harmonik/osilasyon
 
         # --- RESIDUAL katkısı (env cache'lerse) ---
@@ -118,6 +117,18 @@ for ep in range(N):
     pos_rmse = float(np.sqrt(np.mean(pos_sq)));  vel_rmse = float(np.sqrt(np.mean(vel_sq)))
     all_pos_rmse.append(pos_rmse); all_vel_rmse.append(vel_rmse)
     g1 += ever_h; g2 += ever_horiz; g3 += ever_both; succ += is_succ
+
+    # --- TERMINAL ADIM TESHISI: term-? neden? is_success hangi h ile? ---
+    if is_succ:                                              cause = "SUCCESS (env kapisi: h<0.05 & horiz<0.3 & vrel<0.5)"
+    elif last_horiz < 0.3 and last_h < 0.05 and last_vrel >= 0.5: cause = "CRASH (vrel>=0.5)"
+    elif sz < aviary.PLATFORM_TOP - 0.05:                    cause = f"FALL (z={sz:.3f} < {aviary.PLATFORM_TOP-0.05:.3f})"
+    elif abs(roll) > 1.2 or abs(pitch) > 1.2:                cause = "TIP (|r| veya |p| > 1.2)"
+    elif trunc and sim_t > aviary.EPISODE_LEN_SEC:           cause = "TIMEOUT"
+    elif trunc:                                              cause = "ARENA-DISI"
+    else:                                                    cause = "??? (hicbiri)"
+    print(f"    [DBG ep{ep}] term={int(term)} trunc={int(trunc)} is_succ={int(is_succ)} | "
+          f"fin_h={last_h:.4f} fin_horiz={last_horiz:.4f} fin_vrel={last_vrel:.4f} | "
+          f"min_h={min_h:.4f} ever_both={int(ever_both)} | {cause}")
 
     # residual özetleri (cm) — yoksa NaN/“-”
     if has_residual and base_offs:

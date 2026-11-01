@@ -35,12 +35,12 @@ class LandingGuidance:
         self.descent_step = descent_step
         self.contact_offset = contact_offset
         self._t = 0.0
-        self._cmd_z = None
+        self._desc_off = None
 
     def reset_schedule(self):
         """Yeni bölüm başında zamanı ve alçalma çizelgesini sıfırla."""
         self._t = 0.0
-        self._cmd_z = None
+        self._desc_off = None
 
     def position_command(self, drone_pos, drone_vel, platform_pos, platform_vel, dt):
         """İstenen HEDEF KONUMU (3,) ve aktif fazı döndürür."""
@@ -64,15 +64,16 @@ class LandingGuidance:
             return target, "YAKLASMA"
 
         # --- TERMINAL: kararlı takip + yumuşak alçalma ---
-        if self._cmd_z is None:
-            self._cmd_z = drone_pos[2]
-        self._cmd_z = max(self._cmd_z - self.descent_step, contact_z)
-        #target = np.array([platform_pos[0], platform_pos[1], self._cmd_z], dtype=float) Sadece konum
         lead = self.lookahead   # yaklaşık 0.4 s
-        target_xy = platform_pos[:2] + platform_vel[:2] * lead   # platformun öngörülen hareketine göre, artık gerieden takip etmeyecek
-        target = np.array([target_xy[0], target_xy[1], self._cmd_z])
-        return target, "TERMINAL"
+        z_surf = platform_pos[2] + platform_vel[2]*lead + self.contact_offset  # öngörülen ped yüzeyi
 
+        if self._desc_off is None:
+            self._desc_off = max(drone_pos[2] - z_surf, 0.0)   # başlangıç bağıl yükseklik
+        self._desc_off = max(self._desc_off - self.descent_step, 0.0)  # payı kademeli kapat
+
+        target_xy = platform_pos[:2] + platform_vel[:2]*lead
+        target = np.array([target_xy[0], target_xy[1], z_surf + self._desc_off])
+        return target, "TERMINAL"
 
 def position_to_action(target):
     """PID (waypoint) aksiyonu: hedef KONUM, [-1, 1] aralığına kırpılır."""

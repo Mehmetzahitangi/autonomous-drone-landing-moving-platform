@@ -79,6 +79,9 @@ class LandingAviary(BaseRLAviary):
         self.plat_x0=0.0
         self.plat_y0=0.0
 
+        self.heave_amp=0.0
+        self.heave_phase=0.0
+
         super().__init__(drone_model=drone_model,
                          num_drones=1,
                          initial_xyzs=initial_xyzs,
@@ -209,12 +212,16 @@ class LandingAviary(BaseRLAviary):
     def _platform_state(self, t):
         # Platformun gerçek konum ve hızını tek bir yere toplayıp, döndürür 
         w = 2*np.pi*self.plat_freq
+
         x = self.plat_x0 + self.plat_drift[0]*t
         y = self.plat_y0 + self.plat_drift[1]*t + self.plat_amp*np.sin(w*t + self.plat_phase)
-        pos = np.array([x, y, self.PLATFORM_TOP])               # z sabit
+        z  = self.PLATFORM_TOP + self.heave_amp*np.sin(w*t + self.heave_phase)
+
+        vz = self.heave_amp*w*np.cos(w*t + self.heave_phase)
+        pos = np.array([x, y, z])
         vel = np.array([self.plat_drift[0],
                         self.plat_drift[1] + self.plat_amp*w*np.cos(w*t + self.plat_phase),
-                        0.0])
+                        vz])
         return pos, vel
 
     def _relative_state_est(self):
@@ -225,14 +232,14 @@ class LandingAviary(BaseRLAviary):
 
         # gerçek platform (x,y) + ölçüm gürültüsü = sensör ölçümü
         plat_pos, _ = self._platform_state(t) 
-        z = plat_pos[0:2] + np.random.normal(0, self.meas_std, 2) # ölçüm = gerçek (x,y) + gürültü
+        z = plat_pos + np.random.normal(0, self.meas_std, 3)      # (x,y,z) gürültülü ölçüm
 
-        xe = np.ravel(self._imm.step(z)[0])          # [px, vx, py, vy]
+        xe = np.ravel(self._imm.step(z)[0])                        # [px,vx,py,vy,pz,vz]
 
         #x_est, _ = self._imm.step(z)                       # [px, vx, py, vy]
         #x_est = np.ravel(x_est)                            # filterpy (4,1) kolon vektörü → (4,)
-        self.plat_pos_est = np.array([xe[0], xe[2], self.PLATFORM_TOP]) # mutlak kestirimi self'e yazıyoruz, _preprocessAction tabanı bunu okuyacak
-        self.plat_vel_est = np.array([xe[1], xe[3], 0.0])
+        self.plat_pos_est = np.array([xe[0], xe[2], xe[4]]) # mutlak kestirimi self'e yazıyoruz, _preprocessAction tabanı bunu okuyacak
+        self.plat_vel_est = np.array([xe[1], xe[3], xe[5]])
         return self.plat_pos_est - drone_pos, self.plat_vel_est - drone_vel
 
     def reset(self, seed=None, options=None):
@@ -243,6 +250,9 @@ class LandingAviary(BaseRLAviary):
         ang = np.random.uniform(0, 2*np.pi); spd = np.random.uniform(0.0, 0.12)
         self.plat_drift = np.array([spd*np.cos(ang), spd*np.sin(ang)]) # sabit sürüklenme hızı [vx,vy]. Platformun düz kayması (seyreden gemi). ang+spd ile rastgele yöne.
         self.plat_x0, self.plat_y0 = 0.0, 0.0
+
+        self.heave_amp   = np.random.uniform(0.0, 0.06)   # dikey genlik (m); 0 = heave yok
+        self.heave_phase = np.random.uniform(0, 2*np.pi)
 
         # drone başlangıcı 
         x0, y0 = np.random.uniform(-0.5, 0.5, size=2)
@@ -301,7 +311,8 @@ class LandingAviary(BaseRLAviary):
     def _move_platform(self):
         t = self.step_counter / self.PYB_FREQ            # saniye cinsinden sim zamanı
         pos, _ = self._platform_state(t)    
-        p.resetBasePositionAndOrientation(self.PLATFORM_ID, [pos[0], pos[1], 0.05],
+        base_z = pos[2] - 0.02  # # pad yarı-kalınlığı (half[2])
+        p.resetBasePositionAndOrientation(self.PLATFORM_ID, [pos[0], pos[1], base_z],
                                             p.getQuaternionFromEuler([0,0,0]),
                                             physicsClientId=self.CLIENT)
     

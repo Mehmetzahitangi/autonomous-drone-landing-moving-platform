@@ -9,7 +9,10 @@ Dron'un hareket hâlindeki bir platforma (gemi güvertesi / araç / USV) yumuşa
 - ✅ **Faz 3 (düz SAC)** — Hareketli platforma **%100 otonom yumuşak iniş** (10/10 değerlendirme, temas hızı < 0.5 m/s, nazik uçuş; tilt 0.08–0.17 rad)
 - ✅ **Faz 4-A (IMM-EKF kapalı çevrim / POMDP)** — Gözlem ground-truth yerine **kestirilen** platform durumu; gürültülü kestirimle (`meas_std=0.03`) yine **10/10 iniş**, konum kestirim RMSE'si **0.022 m** (eşik 0.3 m'nin çok altında)
 - ✅ **Faz 4-B (Residual RL)** — Klasik ZEM/ZEV güdüm tabanı + SAC artık (residual) düzeltme + terminal hız ileri-beslemesi; **eval %100 / diag 10/10**, konum RMSE **0.02 m**, residual tabanın ~%31'i (taban baskın, RL rötuş)
-- ⏳ **Sıradaki** — zorlaştırma/curriculum (platform domain randomization + dikey heave) → CBF güvenlik → görsel (ArUco) → PX4 SITL
+- ✅ **Faz 4-C (zorlaştırma / domain randomization)**
+  - **C1 — platform randomization:** her bölümde farklı yörünge (faz/genlik/frekans/sürüklenme rastgele); rastgele platformlara **10/10 genelleme**, `RES_SCALE=0.05` yeterli
+  - **C2 — dikey heave:** platform z ekseninde de salınıyor (gemi güvertesi); IMM-EKF 3B'ye genişletildi, terminal **z ileri-beslemesi** eklendi; iniş **~%90-100** (eval %100), konum RMSE **0.03 m**. Kalan zayıf nokta: seyrek terminal temas hızı (Faz 6'da pürüzsüzlük/CBF ile ele alınacak)
+- ⏳ **Sıradaki** — CBF güvenlik + pürüzsüzlük (jerk/temas hızı) → görsel (ArUco) → PX4 SITL
 
 > RL'in rolü **güdüm** katmanı: nereye nişan alınacağını öğrenir. Alçak seviye kontrol DSL-PID'de,
 > platform durumu kestirimi IMM-EKF'te kalır (GNC katmanlaması).
