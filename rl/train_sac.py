@@ -16,12 +16,12 @@ env_kwargs=dict(obs=ObservationType.KIN, act=ACT, initial_xyzs=np.array([[0.0, 0
 
 # Eğitim ve değerlendirme ortamları
 train_env = make_vec_env(LandingAviary, n_envs=1, seed=0,
-                         env_kwargs=dict(obs=ObservationType.KIN, act=ACT))
+                         env_kwargs=dict(obs=ObservationType.KIN, act=ACT,use_cbf=True))
 
 train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
 
 # eval_env → EvalCallback için. SB3, eğitim sırasında politikayı periyodik olarak bu env’de dener: ilerlemeyi ölçer (eval/mean_reward) ve en iyi modeli kaydeder (sac_best/). Bu eğitimimin bir parçası —  Monitoring ve checkpointing için. 
-eval_env = make_vec_env(LandingAviary, n_envs=1, seed=1,env_kwargs=dict(obs=ObservationType.KIN, act=ACT))
+eval_env = make_vec_env(LandingAviary, n_envs=1, seed=1,env_kwargs=dict(obs=ObservationType.KIN, act=ACT,use_cbf=True))
 
 eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False,clip_obs=10.0, training=False)
 

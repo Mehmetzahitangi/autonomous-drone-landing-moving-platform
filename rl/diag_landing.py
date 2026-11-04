@@ -42,7 +42,7 @@ vn.training = False
 model = SAC.load("reports/sac_landing")
 
 # Rollout için HAM env (use_estimator varsayılan True → obs'ta kestirim)
-aviary = LandingAviary(gui=False, act=ACT, obs=ObservationType.KIN)
+aviary = LandingAviary(gui=False, act=ACT, obs=ObservationType.KIN, use_cbf=True)
 has_residual = getattr(aviary, "use_residual", False)
 print(f"use_estimator = {aviary.use_estimator} | meas_std = {aviary.meas_std} m | "
       f"use_residual = {has_residual}")
@@ -58,6 +58,7 @@ print("-" * 120)
 
 for ep in range(N):
     obs, info = aviary.reset()
+    aviary.use_cbf = True
     term = trunc = False
 
     min_h = 1e9; h_at_horiz = h_at_vrel = np.nan

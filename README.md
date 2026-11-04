@@ -11,8 +11,9 @@ Dron'un hareket hâlindeki bir platforma (gemi güvertesi / araç / USV) yumuşa
 - ✅ **Faz 4-B (Residual RL)** — Klasik ZEM/ZEV güdüm tabanı + SAC artık (residual) düzeltme + terminal hız ileri-beslemesi; **eval %100 / diag 10/10**, konum RMSE **0.02 m**, residual tabanın ~%31'i (taban baskın, RL rötuş)
 - ✅ **Faz 4-C (zorlaştırma / domain randomization)**
   - **C1 — platform randomization:** her bölümde farklı yörünge (faz/genlik/frekans/sürüklenme rastgele); rastgele platformlara **10/10 genelleme**, `RES_SCALE=0.05` yeterli
-  - **C2 — dikey heave:** platform z ekseninde de salınıyor (gemi güvertesi); IMM-EKF 3B'ye genişletildi, terminal **z ileri-beslemesi** eklendi; iniş **~%90-100** (eval %100), konum RMSE **0.03 m**. Kalan zayıf nokta: seyrek terminal temas hızı (Faz 6'da pürüzsüzlük/CBF ile ele alınacak)
-- ⏳ **Sıradaki** — CBF güvenlik + pürüzsüzlük (jerk/temas hızı) → görsel (ArUco) → PX4 SITL
+  - **C2 — dikey heave:** platform z ekseninde de salınıyor (gemi güvertesi); IMM-EKF 3B'ye genişletildi, terminal **z ileri-beslemesi** eklendi; iniş **~%90-100** (eval %100), konum RMSE **0.03 m**. Kalan zayıf nokta: seyrek terminal temas hızı (Faz 6'da CBF ile ele alındı)
+- ✅ **Faz 6 (CBF güvenlik kalkanı + kalkanlı RL)** — dikey temas-hızı + yatay hız bariyerleri (kapalı-form, terminal bölgede aktif); politika **kalkanla birlikte** yeniden eğitildi (shielded RL). 50 eşli tohumda kalkan başarıyı 35→43 çıkarıyor ve **worst-case temas hızını 2.37→0.64 m/s'ye sınırlıyor** (sert güvenlik tavanı). Detay: `reports/faz6_cbf/SONUC.md`
+- ⏳ **Sıradaki** — Faz 5 RARL (düşmanca rüzgâr/bozulma sağlamlığı) → ArUco → PX4 SITL
 
 > RL'in rolü **güdüm** katmanı: nereye nişan alınacağını öğrenir. Alçak seviye kontrol DSL-PID'de,
 > platform durumu kestirimi IMM-EKF'te kalır (GNC katmanlaması).

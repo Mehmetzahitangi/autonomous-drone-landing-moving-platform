@@ -6,6 +6,7 @@ import pybullet as p
 from gymnasium import spaces
 from estimation.imm_ekf import PlatformIMM
 from guidance.landing_guidance import LandingGuidance
+from safety.cbf_shield import VerticalContactCBF
 
 class LandingAviary(BaseRLAviary):
     """LandingAviary
@@ -32,7 +33,9 @@ class LandingAviary(BaseRLAviary):
                  gui=False,
                  record=False,
                  obs: ObservationType=ObservationType.KIN,
-                 act: ActionType=ActionType.RPM):
+                 act: ActionType=ActionType.RPM,
+                 use_cbf: bool=False,
+                 dr_wind: bool=False):
         """Initialization of a LandingAviary object.
 
         Parameters
@@ -57,7 +60,8 @@ class LandingAviary(BaseRLAviary):
             The desired observation type (sensor suite), by default ObservationType.KIN
         act : ActionType, optional
             The desired action type (control suite), by default ActionType.RPM
-
+        dr_wind : bool, optional
+            Whether to use wind disturbances, by default False
         """
 
         self.TARGET_POS = np.array([0,0,1])
@@ -67,7 +71,7 @@ class LandingAviary(BaseRLAviary):
         self.plat_amp   = 0.2                    # m    (dalga genliği)
         self.plat_freq  = 0.3                    # Hz   (dalga frekansı)
 
-        self.ACT_SCALE = 0.1   # adım başına +- 0.1 m hedef offset → 9° eğim (nazik). Yavaş kalırsa 0.2'ye çıkar.
+        self.ACT_SCALE = 0.1   # adım başına +- 0.1 m hedef offset → 9 derece eğim (nazik). Yavaş kalırsa 0.2'ye çıkar.
 
         self.meas_std = 0.03        # sensör ölçüm gürültüsü std(m), ArUco/görsel deki gibi
         self.use_estimator = True   # True: obs'de kestirim kullanır, gerçekçi. False: eski ground-truth A/B testi için kullanılabilir
@@ -81,6 +85,13 @@ class LandingAviary(BaseRLAviary):
 
         self.heave_amp=0.0
         self.heave_phase=0.0
+
+        self.use_cbf = use_cbf
+        self._cbf = None
+
+        self.WIND_MAX = 0.03          # N, DR yatay rüzgar üst sınırı
+        self._wind = np.zeros(3)
+        self.dr_wind = dr_wind        # True: reset'te rastgele sabit rüzgar örnekle
 
         super().__init__(drone_model=drone_model,
                          num_drones=1,
@@ -242,7 +253,29 @@ class LandingAviary(BaseRLAviary):
         self.plat_vel_est = np.array([xe[1], xe[3], xe[5]])
         return self.plat_pos_est - drone_pos, self.plat_vel_est - drone_vel
 
+    def _physics(self, rpm, nth_drone):
+        super()._physics(rpm, nth_drone)                 # motor itkileri (orijinal)
+        if self._wind is not None and np.any(self._wind):
+            pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[nth_drone],
+                                                     physicsClientId=self.CLIENT)
+            p.applyExternalForce(self.DRONE_IDS[nth_drone], -1,
+                                 forceObj=self._wind.tolist(), posObj=pos,
+                                 flags=p.WORLD_FRAME, physicsClientId=self.CLIENT)
+    
+
+    def set_wind(self, a_xy):      # a_xy ∈ [-1,1]^2 (RARL adversary aksiyonu); WIND_MAX ile ölçeklenir
+        self._wind = np.array([self.WIND_MAX*float(a_xy[0]), self.WIND_MAX*float(a_xy[1]), 0.0])
+
     def reset(self, seed=None, options=None):
+        
+        # domain randomization: her bölümde rastgele sabit rüzgar (yön + şiddet)
+        if self.dr_wind:
+            wang = np.random.uniform(0, 2*np.pi)
+            wmag = np.random.uniform(0.0, self.WIND_MAX)   # [0, WIND_MAX] N
+            self._wind = np.array([wmag*np.cos(wang), wmag*np.sin(wang), 0.0])
+        else:
+            self._wind = np.zeros(3)                        # eval/diag: rüzgarsız
+
         # platform randomizationı (her bölüm farklı yörünge) 
         self.plat_phase = np.random.uniform(0, 2*np.pi) # Platform artık hep y=0'dan yukarı değil, farklı noktadan sallanmaya başlar
         self.plat_amp   = np.random.uniform(0.10, 0.30) # salınım genliği (m). Ne kadar geniş sallanıyor (deniz durumu şiddeti)
@@ -263,6 +296,7 @@ class LandingAviary(BaseRLAviary):
         self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
         self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC)
         self._guid.reset_schedule()
+        self._cbf = VerticalContactCBF(look=self._guid.lookahead, dt=self.CTRL_TIMESTEP)
 
         obs = super().reset(seed=seed, options=options)
         r_rel, _ = self._relative_state()
@@ -396,6 +430,9 @@ class LandingAviary(BaseRLAviary):
             else:
                 target_pos = drone_pos + self.ACT_SCALE * action[k, :]     # eski düz SAC yolu
 
+            if self.use_cbf:
+                target_pos, self._dbg_cbf = self._cbf.filter(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, target_pos)
+    
             rpm_k, _, _ = self.ctrl[k].computeControl(
                 control_timestep=dt,
                 cur_pos=drone_pos,  cur_quat=state[3:7],
@@ -404,16 +441,3 @@ class LandingAviary(BaseRLAviary):
             rpm[k, :] = rpm_k
         return rpm
     
-            #target_pos = state[0:3] + self.ACT_SCALE * action[k, :]   # # SAC tüm hedefi veriyor
-            #Residual RL:
-            #target_base, phase = self._guid.position_command(drone_pos, drone_vel, plat_pos_est, plat_vel_est, dt)
-            #target_pos = target_base + self.RES_SCALE * action[k, :]  # SAC sadece düzeltir
-
-
-            #rpm_k, _, _ = self.ctrl[k].computeControl(
-            #    control_timestep=self.CTRL_TIMESTEP,
-            #    cur_pos=state[0:3],  cur_quat=state[3:7],
-            #    cur_vel=state[10:13], cur_ang_vel=state[13:16],
-            #    target_pos=target_pos)
-            #rpm[k, :] = rpm_k
-        #return rpm"""
