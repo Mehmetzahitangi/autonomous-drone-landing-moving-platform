@@ -1,3 +1,5 @@
+import pathlib
+
 import numpy as np
 
 from gym_pybullet_drones.envs.BaseRLAviary import BaseRLAviary
@@ -7,6 +9,7 @@ from gymnasium import spaces
 from estimation.imm_ekf import PlatformIMM
 from guidance.landing_guidance import LandingGuidance
 from safety.cbf_shield import VerticalContactCBF
+from perception.aruco_detector import ArucoCamera, cam_config
 
 class LandingAviary(BaseRLAviary):
     """LandingAviary
@@ -35,7 +38,9 @@ class LandingAviary(BaseRLAviary):
                  obs: ObservationType=ObservationType.KIN,
                  act: ActionType=ActionType.RPM,
                  use_cbf: bool=False,
-                 dr_wind: bool=False):
+                 dr_wind: bool=False,
+                use_aruco: bool=False,
+                cam_cfg=None,):
         """Initialization of a LandingAviary object.
 
         Parameters
@@ -93,6 +98,26 @@ class LandingAviary(BaseRLAviary):
         self._wind = np.zeros(3)
         self.dr_wind = dr_wind        # True: reset'te rastgele sabit rüzgar örnekle
 
+        self.MARKER_ID   = 23
+        self.MARKER_SIZE = 0.42   # m, fiziksel marker kenarı (make_marker.py layout'u ile eşleşir)
+
+        self.use_aruco = use_aruco
+        # cam_cfg: None/'ideal' (eski davranış) | 'realistic' | dict (bkz. perception/aruco_detector.py CAM_PRESETS)
+        self.cam_cfg = cam_config(cam_cfg)
+        self._cam = None
+        self._marker_visible = False
+        self._meas_queue = []         # (teslim_tik, z_dunya, yakalama_tik) — gecikmeli ölçümler
+        self._tick = 0                # kontrol-adımı sayacı (yalnız algı zamanlaması için)
+        self._cam_frames = 0          # bölümde yakalanan kare sayısı
+        self._cam_dets = 0            # bölümde tag bulunan kare sayısı
+        self._meas_age = 0            # son teslim edilen ölçümün yaşı (adım)
+        self._sens_rng = np.random.default_rng()
+
+        self.init_xy_max = 0.5            # yatay baslangic ofset siniri (curriculum ile ayarlanir)
+        self.init_z_lo, self.init_z_hi = 0.6, 1.0
+
+        self._steps_since_meas = 0    # son olcumden kac adim gecti
+
         super().__init__(drone_model=drone_model,
                          num_drones=1,
                          initial_xyzs=initial_xyzs,
@@ -149,6 +174,10 @@ class LandingAviary(BaseRLAviary):
 
         # Toplam adım ödülü
         step_reward = reward_approach + penalty_xy + penalty_z + penalty_vel + penalty_action - step_penalty
+
+        # Aktif algi tesviki: marker gorunurse kucuk bonus -> markeri kadrajda tutmayi ogrenir
+        if self.use_aruco:
+            step_reward += 0.3 * float(self._marker_visible)
 
         #  Terminal Bonus ve Cezaları 
 
@@ -236,22 +265,55 @@ class LandingAviary(BaseRLAviary):
         return pos, vel
 
     def _relative_state_est(self):
-
         s = self._getDroneStateVector(0)
         drone_pos, drone_vel = s[0:3], s[10:13]
         t = self.step_counter / self.PYB_FREQ
 
-        # gerçek platform (x,y) + ölçüm gürültüsü = sensör ölçümü
-        plat_pos, _ = self._platform_state(t) 
-        z = plat_pos + np.random.normal(0, self.meas_std, 3)      # (x,y,z) gürültülü ölçüm
+        if self.use_aruco:
+            z = self._camera_pipeline()                  # bu adımda TESLİM edilen ölçüm ya da None
+            self._marker_visible = (z is not None)
+            self._steps_since_meas = 0 if z is not None else self._steps_since_meas + 1
+            if z is not None:
+                xe = np.ravel(self._imm.step(z)[0])      # ölçümle güncelle
+            else:
+                xe = np.ravel(self._imm.predict_only())  # ölçüm yok (kare yok / tag yok / yolda) → tahmin
+        else:
+            # eski yol: gerçek platform + Gauss gürültü (fallback)
+            plat_pos, _ = self._platform_state(t)
+            z = plat_pos + np.random.normal(0, self.meas_std, 3)
+            xe = np.ravel(self._imm.step(z)[0])
 
-        xe = np.ravel(self._imm.step(z)[0])                        # [px,vx,py,vy,pz,vz]
-
-        #x_est, _ = self._imm.step(z)                       # [px, vx, py, vy]
-        #x_est = np.ravel(x_est)                            # filterpy (4,1) kolon vektörü → (4,)
-        self.plat_pos_est = np.array([xe[0], xe[2], xe[4]]) # mutlak kestirimi self'e yazıyoruz, _preprocessAction tabanı bunu okuyacak
+        self.plat_pos_est = np.array([xe[0], xe[2], xe[4]])
         self.plat_vel_est = np.array([xe[1], xe[3], xe[5]])
         return self.plat_pos_est - drone_pos, self.plat_vel_est - drone_vel
+
+    def _camera_pipeline(self):
+        """Gerçekçi algı zamanlaması: kamera kendi hızında kare yakalar (cfg['hz']), her ölçüm
+        işleme+iletim gecikmesiyle (latency ± jitter) kuyruğa girer, vakti gelince teslim edilir.
+        Teslim edilen ölçüm, YAKALANDIĞI andaki pad konumunu taşır (yani bayattır).
+        ideal cfg (hz=None, latency=0) → her adım kare, anında teslim = eski davranış."""
+        c = self.cam_cfg
+        if self._cam is None:   # ilk kullanımda (DRONE_IDS hazırken) kur
+            self._cam = ArucoCamera(self.CLIENT, self.DRONE_IDS[0], cfg=c, rng=self._sens_rng)
+
+        period = 1 if not c["hz"] else max(1, int(round(self.CTRL_FREQ / c["hz"])))
+        if self._tick % period == 0:
+            m = self._cam.measure()
+            self._cam_frames += 1
+            if m is not None:
+                self._cam_dets += 1
+                lat = c["latency_s"] + self._sens_rng.uniform(-1, 1) * c["latency_jitter_s"]
+                delay = max(0, int(round(lat * self.CTRL_FREQ)))
+                self._meas_queue.append((self._tick + delay, m["z"], self._tick))
+
+        ready = [q for q in self._meas_queue if q[0] <= self._tick]
+        self._meas_queue = [q for q in self._meas_queue if q[0] > self._tick]
+        z = None
+        if ready:
+            _, z, cap = max(ready, key=lambda q: q[2])   # en taze yakalanan
+            self._meas_age = self._tick - cap
+        self._tick += 1
+        return z
 
     def _physics(self, rpm, nth_drone):
         super()._physics(rpm, nth_drone)                 # motor itkileri (orijinal)
@@ -266,8 +328,19 @@ class LandingAviary(BaseRLAviary):
     def set_wind(self, a_xy):      # a_xy ∈ [-1,1]^2 (RARL adversary aksiyonu); WIND_MAX ile ölçeklenir
         self._wind = np.array([self.WIND_MAX*float(a_xy[0]), self.WIND_MAX*float(a_xy[1]), 0.0])
 
+    def set_init_difficulty(self, xy_max=None, z_lo=None, z_hi=None):
+        """Curriculum: baslangic zorlugunu ayarla (kucuk ofset = kolay)."""
+        if xy_max is not None: self.init_xy_max = float(xy_max)
+        if z_lo   is not None: self.init_z_lo   = float(z_lo)
+        if z_hi   is not None: self.init_z_hi   = float(z_hi)
+
     def reset(self, seed=None, options=None):
-        
+                
+        self._cam = None   # her reset'te DRONE_IDS yenilenir, kamerayı yeniden bağlar
+        self._steps_since_meas = 0
+        self._meas_queue, self._tick = [], 0
+        self._cam_frames = self._cam_dets = self._meas_age = 0
+
         # domain randomization: her bölümde rastgele sabit rüzgar (yön + şiddet)
         if self.dr_wind:
             wang = np.random.uniform(0, 2*np.pi)
@@ -288,15 +361,25 @@ class LandingAviary(BaseRLAviary):
         self.heave_phase = np.random.uniform(0, 2*np.pi)
 
         # drone başlangıcı 
-        x0, y0 = np.random.uniform(-0.5, 0.5, size=2)
-        z0 = np.random.uniform(0.6, 1.0)
+        x0, y0 = np.random.uniform(-self.init_xy_max, self.init_xy_max, size=2)
+        z0 = np.random.uniform(self.init_z_lo, self.init_z_hi)
         self.INIT_XYZS = np.array([[x0, y0, z0]])
+
+        # algı gürültüsü için ayrı RNG (senaryo çekilişlerinden SONRA → aynı seed = aynı senaryo,
+        # kamera ayarı ne olursa olsun; ideal/gerçekçi karşılaştırması eşli kalır)
+        self._sens_rng = np.random.default_rng(np.random.randint(0, 2**31 - 1))
 
         # IMM (randomize edilmiş freq ile) + klasik taban, IMM artık doğru (rastgele) freq'i alıyor.
         self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
         self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC)
         self._guid.reset_schedule()
         self._cbf = VerticalContactCBF(look=self._guid.lookahead, dt=self.CTRL_TIMESTEP)
+
+        # PID iç durumunu (integral + önceki hata) sıfırla. gym-pybullet-drones bunu yalnız
+        # kurucuda yapıyor; yapılmazsa bir bölümün birikmiş integrali (konum ±2, tutum ±1)
+        # sonraki bölüme taşınır → aynı seed sıralı koşuda farklı (bazen uzaklaşan) sonuç verir.
+        for c in getattr(self, "ctrl", []):
+            c.reset()
 
         obs = super().reset(seed=seed, options=options)
         r_rel, _ = self._relative_state()
@@ -329,26 +412,54 @@ class LandingAviary(BaseRLAviary):
         return super().step(action)
 
     def _addObstacles(self):
-        # İnce iniş pedi (1 m'lik küp yerine düz bir plaka). baseMass=0 -> statik,
-        # zaten her adım resetBasePositionAndOrientation ile taşıyoruz.
+        # İnce iniş pedi (collision + görsel kutu). Marker AYRI bir quad olarak üstüne konur.
         half = [0.30, 0.30, 0.02]
         col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half, physicsClientId=self.CLIENT)
         vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half,
-                                  rgbaColor=[0.2, 0.6, 1.0, 1.0], physicsClientId=self.CLIENT)
+                                rgbaColor=[0.2, 0.6, 1.0, 1.0], physicsClientId=self.CLIENT)
         self.PLATFORM_ID = p.createMultiBody(baseMass=0.0,
-                                             baseCollisionShapeIndex=col,
-                                             baseVisualShapeIndex=vis,
-                                             basePosition=[0, 0, 0.05],
-                                             physicsClientId=self.CLIENT)
-        self.PLATFORM_TOP = 0.05 + half[2]   # pedin üst yüzeyi (yaklaşık 0.07 m yükseklik)
+                                            baseCollisionShapeIndex=col,
+                                            baseVisualShapeIndex=vis,
+                                            basePosition=[0, 0, 0.05],
+                                            physicsClientId=self.CLIENT)
+        self.PLATFORM_TOP = 0.05 + half[2]   # ~0.07 m
+
+        # ArUco marker: ayrı ince QUAD mesh (doku kutuya düzgün oturmadığı için)
+        base = pathlib.Path(__file__).resolve().parent.parent / "assets"
+        mvis = p.createVisualShape(p.GEOM_MESH, fileName=str(base / "marker_quad.obj"),
+                                rgbaColor=[1, 1, 1, 1], physicsClientId=self.CLIENT)
+        self.MARKER_BODY = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=-1,
+                                            baseVisualShapeIndex=mvis,
+                                            basePosition=[0, 0, self.PLATFORM_TOP + 0.001],
+                                            physicsClientId=self.CLIENT)
+        tex = p.loadTexture(str(base / "aruco_marker.png"), physicsClientId=self.CLIENT)
+        p.changeVisualShape(self.MARKER_BODY, -1, textureUniqueId=tex, physicsClientId=self.CLIENT)
 
     def _move_platform(self):
-        t = self.step_counter / self.PYB_FREQ            # saniye cinsinden sim zamanı
-        pos, _ = self._platform_state(t)    
-        base_z = pos[2] - 0.02  # # pad yarı-kalınlığı (half[2])
+        t = self.step_counter / self.PYB_FREQ
+        pos, _ = self._platform_state(t)
+        base_z = pos[2] - 0.02   # pad yarı-kalınlığı
         p.resetBasePositionAndOrientation(self.PLATFORM_ID, [pos[0], pos[1], base_z],
-                                            p.getQuaternionFromEuler([0,0,0]),
+                                            p.getQuaternionFromEuler([0, 0, 0]),
                                             physicsClientId=self.CLIENT)
+        # marker quad'ı platform üst yüzeyinde tut (heave dahil)
+        if hasattr(self, "MARKER_BODY"):
+            p.resetBasePositionAndOrientation(self.MARKER_BODY, [pos[0], pos[1], pos[2] + 0.001],
+                                                p.getQuaternionFromEuler([0, 0, 0]),
+                                                physicsClientId=self.CLIENT)
+
+    def _landing_supervisor(self, drone_pos, target_pos):
+        """Durum-makinesi: marker gorunurluk + hizaya gore DIKEY inisi kapiya alir.
+        gorunurluk+hizali -> normal in; hizasiz -> yukseklik tut; kayip -> biraz yuksel (yeniden yakala)."""
+        tp = np.array(target_pos, dtype=float)
+        horiz = np.linalg.norm(self.plat_pos_est[0:2] - drone_pos[0:2])
+        ALIGN_TOL, LOST_MAX = 0.20, 5
+        if self._marker_visible and horiz > ALIGN_TOL:
+            tp[2] = drone_pos[2]                       # HIZALAN: yukseklik tut, yatay yaklas
+        elif (not self._marker_visible) and self._steps_since_meas > LOST_MAX:
+            tp[2] = min(drone_pos[2] + 0.05, 1.0)      # ARA / YENIDEN-YAKALA: biraz yuksel
+        # else: ALCAL -> tp aynen (normal inis)
+        return tp
     
     def _computeInfo(self):
         r_rel, v_rel = self._relative_state()
@@ -360,7 +471,15 @@ class LandingAviary(BaseRLAviary):
 
         success = bool(horiz < 0.3 and h < 0.05 and vrel < 0.5)   # terminated'daki başarı koşuluyla aynı
 
-        return {"is_success": success, "touchdown_speed": float(vrel), "horiz": float(horiz)}
+        info = {"is_success": success, "touchdown_speed": float(vrel), "horiz": float(horiz),
+                "vz_rel": float(v_rel[2]), "vxy_rel": float(np.linalg.norm(v_rel[0:2])), "h": float(h)}
+        if hasattr(self, "plat_pos_est"):
+            t = self.step_counter / self.PYB_FREQ
+            info["est_err"] = float(np.linalg.norm(self.plat_pos_est - self._platform_state(t)[0]))
+        if self.use_aruco:
+            info.update(cam_frames=self._cam_frames, cam_dets=self._cam_dets,
+                        stale=self._steps_since_meas, meas_age=self._meas_age)
+        return info
 
     def _relative_state(self):
         s = self._getDroneStateVector(0)
@@ -376,8 +495,10 @@ class LandingAviary(BaseRLAviary):
         
         if self.OBS_TYPE == ObservationType.KIN:
             # 6 yeni değişken (3 konum + 3 hız) için sonsuz (-inf, +inf) sınırlar oluştur
-            extra_low = np.full((self.NUM_DRONES, 6), -np.inf, dtype=np.float32)
-            extra_high = np.full((self.NUM_DRONES, 6), np.inf, dtype=np.float32)
+            n_extra = 6
+            extra_low = np.full((self.NUM_DRONES, n_extra), -np.inf, dtype=np.float32)
+            extra_high = np.full((self.NUM_DRONES, n_extra), np.inf, dtype=np.float32)
+
             
             # BaseRLAviary'den gelen uzayın sonuna ekle
             new_low = np.hstack([base_space.low, extra_low])
@@ -394,14 +515,10 @@ class LandingAviary(BaseRLAviary):
         
         if self.OBS_TYPE == ObservationType.KIN:
             r_rel, v_rel = self._relative_state_est() if self.use_estimator else self._relative_state()
-            
-            # Her dron için ek gözlemleri dizi formatına çevirir
-            extra_obs = np.array([np.hstack([r_rel, v_rel]) for _ in range(self.NUM_DRONES)])
-            
-            # Temel gözlemlerle yan yana birleştirilir
+            feat = list(r_rel) + list(v_rel)
+            extra_obs = np.array([feat for _ in range(self.NUM_DRONES)])
             new_obs = np.hstack([base_obs, extra_obs]).astype(np.float32)
             return new_obs
-            
         return base_obs
 
     def _preprocessAction(self, action):
@@ -429,6 +546,8 @@ class LandingAviary(BaseRLAviary):
                 self._dbg_res_off  = float(self.RES_SCALE * np.linalg.norm(action[k, :]))
             else:
                 target_pos = drone_pos + self.ACT_SCALE * action[k, :]     # eski düz SAC yolu
+                if self.use_aruco:                         # durum-makinesi sadece gorsel modda
+                    target_pos = self._landing_supervisor(drone_pos, target_pos)
 
             if self.use_cbf:
                 target_pos, self._dbg_cbf = self._cbf.filter(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, target_pos)

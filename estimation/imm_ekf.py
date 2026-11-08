@@ -45,3 +45,8 @@ class PlatformIMM:
         """z=[px,py,pz] ==> (6-durum kestirim, 2 mod)."""
         self.imm.predict(); self.imm.update(np.asarray(z, dtype=float))
         return self.imm.x.copy(), self.imm.mu.copy()
+
+    def predict_only(self):
+        """Ölçüm yokken (dropout): sadece tahmin ilerlet, güncelleme yok."""
+        self.imm.predict()
+        return self.imm.x.copy()
