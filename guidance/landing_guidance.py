@@ -26,6 +26,9 @@ class LandingGuidance:
                  h_switch=0.15,       # bu irtifanın (m) altında TERMINAL faza geç
                  descent_step=0.004,  # terminal fazda adım başı iniş (m) ~0.12 m/s @30Hz
                  contact_offset=0.05, # ped üstünde hedeflenecek pay (m)
+                 v_ref=0.5,           # tgo = mesafe / v_ref için nominal yaklaşma hızı (m/s)
+                 t_go_max=4.0,        # tgo ust siniri (uzakta kazanclari asiri kucultme)
+                 hold_step=0.15,      # HİZALAN'da hedefin dronun en fazla bu kadar ötesine konması (m)
                  **_):
         self.t_land = t_land
         self.t_go_min = t_go_min
@@ -36,19 +39,44 @@ class LandingGuidance:
         self.contact_offset = contact_offset
         self._t = 0.0
         self._desc_off = None
+        self.v_ref = v_ref
+        self.t_go_max = t_go_max    
+
+        self._holding = False
+        self._hold_z  = None
+        self.hold_step = hold_step
 
     def reset_schedule(self):
         """Yeni bölüm başında zamanı ve alçalma çizelgesini sıfırla."""
         self._t = 0.0
         self._desc_off = None
+        self._holding = False
+        self._hold_z  = None
 
-    def position_command(self, drone_pos, drone_vel, platform_pos, platform_vel, dt):
-        """İstenen HEDEF KONUMU (3,) ve aktif fazı döndürür."""
-        self._t += dt
+    def position_command(self, drone_pos, drone_vel, platform_pos, platform_vel, dt, hold=False):
+        """İstenen HEDEF KONUMU (3,) ve aktif fazı döndürür.
+        hold=True: hizalanana kadar irtifa tut — güdüm saati ve terminal iniş çizelgesi DONAR."""
+        if hold and not self._holding:
+            self._hold_z = float(drone_pos[2])     # bekleme BAŞLADIĞI andaki irtifa (sabit)
+        self._holding = hold
+        if not hold:
+            self._t += dt                          # beklerken saat işlemez → t_go çökmez
         h = drone_pos[2] - platform_pos[2]
         contact_z = platform_pos[2] + self.contact_offset
 
         if h > self.h_switch:
+            if hold:
+                # HİZALAN: irtifayı tut, pad'in (öngörülen) üstüne yatayda git — PX4 "horizontal approach"
+                lead = self.lookahead
+                txy = platform_pos[:2] + platform_vel[:2] * lead
+                # Hedefi dronun en fazla hold_step ötesine koy ("havuç"): uzak konum hedefi DSL PID'i
+                # sert yatırıp takla attırır (ZEM/ZEV ara noktası da hep ~0.25 m altında kalıyordu).
+                d = txy - drone_pos[:2]
+                n = np.linalg.norm(d)
+                if n > self.hold_step:
+                    txy = drone_pos[:2] + d * (self.hold_step / n)
+                return np.array([txy[0], txy[1], max(self._hold_z, contact_z)]), "HIZALAN"
+    
             # --- YAKLAŞMA: ZEM/ZEV optimal yasası ---
             t_go = max(self.t_land - self._t, self.t_go_min)   # temasa kalan süre (çizelge)
             r_rel = platform_pos - drone_pos                    # istenen 0 (pede otur)
@@ -69,7 +97,8 @@ class LandingGuidance:
 
         if self._desc_off is None:
             self._desc_off = max(drone_pos[2] - z_surf, 0.0)   # başlangıç bağıl yükseklik
-        self._desc_off = max(self._desc_off - self.descent_step, 0.0)  # payı kademeli kapat
+        if not hold:
+            self._desc_off = max(self._desc_off - self.descent_step, 0.0)  # payı kademeli kapat; beklerken donar
 
         target_xy = platform_pos[:2] + platform_vel[:2]*lead
         target = np.array([target_xy[0], target_xy[1], z_surf + self._desc_off])

@@ -11,6 +11,17 @@ from guidance.landing_guidance import LandingGuidance
 from safety.cbf_shield import VerticalContactCBF
 from perception.aruco_detector import ArucoCamera, cam_config
 
+# "Önce hizalan, sonra in" kapısı varsayılanları (align_cfg ile ezilir)
+AF_DEFAULTS = dict(
+    r0=0.10,          # koni tabanı (m): h→0'da izin verilen yatay hata
+    k=0.30,           # koni eğimi: tol = r0 + k·h  (h=0.8→0.34, 0.4→0.22, 0.2→0.16 m)
+    vtol=None,        # yatay bağıl hız eşiği (m/s); None = hız şartı yok
+    stale_max=10,     # bu kadar adım (~0.33 s) ölçüm gelmezse alçalma (bayat kestirimle inme)
+    commit_h=0.12,    # bunun altında kapı YOK: kamera zaten kör bölgede → kararlı otur, iptal etme
+    climb_after=None, # beklerken bu kadar adım ölçüm yoksa yavaşça tırman (yeniden yakala); None = kapalı
+    z_search=0.6,     # tırmanma tavanı (pad üstü, m)
+)
+
 class LandingAviary(BaseRLAviary):
     """LandingAviary
 
@@ -40,7 +51,9 @@ class LandingAviary(BaseRLAviary):
                  use_cbf: bool=False,
                  dr_wind: bool=False,
                 use_aruco: bool=False,
-                cam_cfg=None,):
+                cam_cfg=None,
+                align_cfg=None,
+                episode_len_sec: float=8.0,):
         """Initialization of a LandingAviary object.
 
         Parameters
@@ -70,7 +83,7 @@ class LandingAviary(BaseRLAviary):
         """
 
         self.TARGET_POS = np.array([0,0,1])
-        self.EPISODE_LEN_SEC = 8
+        self.EPISODE_LEN_SEC = float(episode_len_sec)   # bölüm süresi (güdüm çizelgesi T_LAND'den bağımsız)
 
         self.plat_drift = np.array([0.1, 0.0])  # m/s  (x,y sürüklenme)
         self.plat_amp   = 0.2                    # m    (dalga genliği)
@@ -113,10 +126,16 @@ class LandingAviary(BaseRLAviary):
         self._meas_age = 0            # son teslim edilen ölçümün yaşı (adım)
         self._sens_rng = np.random.default_rng()
 
-        self.init_xy_max = 0.5            # yatay baslangic ofset siniri (curriculum ile ayarlanir)
+        self.init_xy_max = 0.5            # yatay baslangic ofset siniri (m)
         self.init_z_lo, self.init_z_hi = 0.6, 1.0
 
         self._steps_since_meas = 0    # son olcumden kac adim gecti
+
+        # None = kapı kapalı (eski davranış); dict = AF_DEFAULTS üstüne yazılır, ör. {} veya {"vtol": 0.3}
+        self.align_cfg = None if align_cfg is None else {**AF_DEFAULTS, **align_cfg}
+        self._af_hold = False
+        self._af_hold_steps = 0
+        self.T_LAND = 8.0     # güdüm çizelgesi (bölüm süresinden BAĞIMSIZ)
 
         super().__init__(drone_model=drone_model,
                          num_drones=1,
@@ -328,12 +347,6 @@ class LandingAviary(BaseRLAviary):
     def set_wind(self, a_xy):      # a_xy ∈ [-1,1]^2 (RARL adversary aksiyonu); WIND_MAX ile ölçeklenir
         self._wind = np.array([self.WIND_MAX*float(a_xy[0]), self.WIND_MAX*float(a_xy[1]), 0.0])
 
-    def set_init_difficulty(self, xy_max=None, z_lo=None, z_hi=None):
-        """Curriculum: baslangic zorlugunu ayarla (kucuk ofset = kolay)."""
-        if xy_max is not None: self.init_xy_max = float(xy_max)
-        if z_lo   is not None: self.init_z_lo   = float(z_lo)
-        if z_hi   is not None: self.init_z_hi   = float(z_hi)
-
     def reset(self, seed=None, options=None):
                 
         self._cam = None   # her reset'te DRONE_IDS yenilenir, kamerayı yeniden bağlar
@@ -371,7 +384,9 @@ class LandingAviary(BaseRLAviary):
 
         # IMM (randomize edilmiş freq ile) + klasik taban, IMM artık doğru (rastgele) freq'i alıyor.
         self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
-        self._guid = LandingGuidance(t_land=self.EPISODE_LEN_SEC)
+        self._guid = LandingGuidance(t_land=self.T_LAND)     # eskiden EPISODE_LEN_SEC
+        self._af_hold = False
+        self._af_hold_steps = 0
         self._guid.reset_schedule()
         self._cbf = VerticalContactCBF(look=self._guid.lookahead, dt=self.CTRL_TIMESTEP)
 
@@ -448,18 +463,27 @@ class LandingAviary(BaseRLAviary):
                                                 p.getQuaternionFromEuler([0, 0, 0]),
                                                 physicsClientId=self.CLIENT)
 
-    def _landing_supervisor(self, drone_pos, target_pos):
-        """Durum-makinesi: marker gorunurluk + hizaya gore DIKEY inisi kapiya alir.
-        gorunurluk+hizali -> normal in; hizasiz -> yukseklik tut; kayip -> biraz yuksel (yeniden yakala)."""
-        tp = np.array(target_pos, dtype=float)
-        horiz = np.linalg.norm(self.plat_pos_est[0:2] - drone_pos[0:2])
-        ALIGN_TOL, LOST_MAX = 0.20, 5
-        if self._marker_visible and horiz > ALIGN_TOL:
-            tp[2] = drone_pos[2]                       # HIZALAN: yukseklik tut, yatay yaklas
-        elif (not self._marker_visible) and self._steps_since_meas > LOST_MAX:
-            tp[2] = min(drone_pos[2] + 0.05, 1.0)      # ARA / YENIDEN-YAKALA: biraz yuksel
-        # else: ALCAL -> tp aynen (normal inis)
-        return tp
+    def _descent_gate(self, drone_pos, drone_vel):
+        """Önce hizalan, sonra in (PX4 precland yatay yaklaşma + NimbRo görüş konisi mantığı).
+        True → bekle (irtifa tut, yatayda pad'e git); False → alçal. Histerezisli."""
+        c = self.align_cfg
+        pe, ve = self.plat_pos_est, self.plat_vel_est
+        h = drone_pos[2] - pe[2]
+        if h < c["commit_h"]:                     # son santimler: iptal yok
+            self._af_hold = False
+            return False
+        horiz = np.linalg.norm(pe[0:2] - drone_pos[0:2])
+        vrel  = np.linalg.norm(ve[0:2] - drone_vel[0:2])
+        tol   = c["r0"] + c["k"] * h
+        vtol  = c["vtol"]
+        stale = self._steps_since_meas > c["stale_max"]
+        if self._af_hold:    # bekliyor → tam hizalanınca bırak
+            ok = (horiz < tol) and (vtol is None or vrel < vtol) and not stale
+            self._af_hold = not ok
+        else:                # alçalıyor → belirgin bozulunca dur (1.3× histerezis, titreşmesin)
+            bad = (horiz > 1.3 * tol) or (vtol is not None and vrel > 1.3 * vtol) or stale
+            self._af_hold = bad
+        return self._af_hold
     
     def _computeInfo(self):
         r_rel, v_rel = self._relative_state()
@@ -473,12 +497,14 @@ class LandingAviary(BaseRLAviary):
 
         info = {"is_success": success, "touchdown_speed": float(vrel), "horiz": float(horiz),
                 "vz_rel": float(v_rel[2]), "vxy_rel": float(np.linalg.norm(v_rel[0:2])), "h": float(h)}
+        info["af_hold_steps"] = int(getattr(self, "_af_hold_steps", 0))
         if hasattr(self, "plat_pos_est"):
             t = self.step_counter / self.PYB_FREQ
             info["est_err"] = float(np.linalg.norm(self.plat_pos_est - self._platform_state(t)[0]))
         if self.use_aruco:
             info.update(cam_frames=self._cam_frames, cam_dets=self._cam_dets,
                         stale=self._steps_since_meas, meas_age=self._meas_age)
+            
         return info
 
     def _relative_state(self):
@@ -534,20 +560,22 @@ class LandingAviary(BaseRLAviary):
             drone_pos, drone_vel = state[0:3], state[10:13]
 
             if self.use_residual:
-                # Klasik ZEM/ZEV tabanı — gözlemle aynı kestirimi okur (self._plat_*_est).
-                # Bu cache _relative_state_est her adım günceller, filtreyi BURADA tekrar adımlamıyoruz (yoksa adım başına iki kez adımlanırdı!!!)
+                hold = self._descent_gate(drone_pos, drone_vel) if self.align_cfg is not None else False
+                target_base, phase = self._guid.position_command(
+                    drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, dt, hold=hold)
+                target_pos = target_base + self.RES_SCALE * action[k, :]   # taban + residual (RL aynen)
 
-                target_base, phase = self._guid.position_command(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, dt)
-                target_pos = target_base + self.RES_SCALE * action[k, :]   # taban + residual, SAC sadece düzeltir
+                c = self.align_cfg
+                if hold and c["climb_after"] is not None and self._steps_since_meas > c["climb_after"]:
+                    # uzun süre kör bekliyorsa yavaşça tırman → tag kadraja geri girsin
+                    target_pos[2] = min(drone_pos[2] + 0.03, self.plat_pos_est[2] + c["z_search"])
+                self._af_hold_steps += int(hold)
 
-                # landing_diag da residual katkısını ölçmek için
                 self._dbg_phase    = phase
                 self._dbg_base_off = float(np.linalg.norm(target_base - drone_pos))
                 self._dbg_res_off  = float(self.RES_SCALE * np.linalg.norm(action[k, :]))
             else:
-                target_pos = drone_pos + self.ACT_SCALE * action[k, :]     # eski düz SAC yolu
-                if self.use_aruco:                         # durum-makinesi sadece gorsel modda
-                    target_pos = self._landing_supervisor(drone_pos, target_pos)
+                target_pos = drone_pos + self.ACT_SCALE * action[k, :]     # Faz 3 düz SAC yolu (use_residual=False); tekrar üretim için tutuluyor
 
             if self.use_cbf:
                 target_pos, self._dbg_cbf = self._cbf.filter(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, target_pos)

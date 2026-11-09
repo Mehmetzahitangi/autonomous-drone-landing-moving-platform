@@ -26,7 +26,7 @@ Dron'un hareket hâlindeki bir platforma (gemi güvertesi / araç / USV) yumuşa
 | `guidance/` | ZEM + alçalma profili (klasik taban) | Faz 2 |
 | `rl/` | SAC eğitim/değerlendirme giriş noktaları (`train_sac.py`, `eval_sac.py`, `diag_landing.py`); residual RL, RARL | Faz 3–5 |
 | `safety/` | CBF kalkanı: koridor + temas limiti + abort | Faz 6 |
-| `vision/` | ArUco ped tespiti, pikselden göreli poz | Faz 7 |
+| `perception/` | AprilTag ped tespiti + gerçekçi kamera modeli, pikselden göreli poz (`vision/` eski) | Faz 7 |
 | `px4_bridge/` | politikanın ROS2 düğümü sarmalı, PX4 SITL | Faz 8 |
 | `reports/` | tablolar, grafikler, SONUC notları | — |
 
