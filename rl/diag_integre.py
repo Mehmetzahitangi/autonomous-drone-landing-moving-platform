@@ -2,9 +2,10 @@
 diag_integre.py — FINAL ENTEGRE DOĞRULAMA: kazanan politika (faz4c) + CBF kalkanı,
 sabit (held-out) rüzgâr altında. "Rüzgârda iniyor MU ve temas hızı güvenli Mİ?" tek test.
 
-Fikir: Faz 5'in kazananı faz4c çıktı (DR/RARL onu geçemedi). faz4c zaten CBF AÇIK
-eğitildi (train_sac: use_cbf=True), yani CBF'i deploy'da açmak eğitim-deploy UYUMLU
-doğal konfig. Burada aynı eşli rüzgâr ızgarasında iki konfigi yan yana koyarız:
+Fikir: Faz 5'in kazananı faz4c çıktı (DR/RARL onu geçemedi).
+DÜZELTME (2026-11-08): faz4c CBF KAPALI eğitildi (c0ed56c'deki train_sac.py'de use_cbf yok);
+CBF ile eğitilen model faz6_cbf'tir. Yani bu scriptteki "CBF AÇIK" satırı faz4c için
+eğitim-deploy UYUMSUZ bir konfigdir. Burada aynı eşli rüzgâr ızgarasında iki konfigi yan yana koyarız:
   - CBF KAPALI: kalkansız (diag_rarl'daki nominal ile aynı sayılar — referans).
   - CBF AÇIK : kalkan devrede. Beklenti: başarı ~= aynı kalır AMA maks vrel (en-kötü
                temas hızı) belirgin düşer. CBF'in işi budur — çarpma hızını sınırlamak.

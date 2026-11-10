@@ -11,16 +11,7 @@ from guidance.landing_guidance import LandingGuidance
 from safety.cbf_shield import VerticalContactCBF
 from perception.aruco_detector import ArucoCamera, cam_config
 
-# "Önce hizalan, sonra in" kapısı varsayılanları (align_cfg ile ezilir)
-AF_DEFAULTS = dict(
-    r0=0.10,          # koni tabanı (m): h→0'da izin verilen yatay hata
-    k=0.30,           # koni eğimi: tol = r0 + k·h  (h=0.8→0.34, 0.4→0.22, 0.2→0.16 m)
-    vtol=None,        # yatay bağıl hız eşiği (m/s); None = hız şartı yok
-    stale_max=10,     # bu kadar adım (~0.33 s) ölçüm gelmezse alçalma (bayat kestirimle inme)
-    commit_h=0.12,    # bunun altında kapı YOK: kamera zaten kör bölgede → kararlı otur, iptal etme
-    climb_after=None, # beklerken bu kadar adım ölçüm yoksa yavaşça tırman (yeniden yakala); None = kapalı
-    z_search=0.6,     # tırmanma tavanı (pad üstü, m)
-)
+from guidance.descent_gate import DescentGate, DEFAULTS as AF_DEFAULTS   # AF_DEFAULTS adı geriye uyum için
 
 class LandingAviary(BaseRLAviary):
     """LandingAviary
@@ -132,8 +123,8 @@ class LandingAviary(BaseRLAviary):
         self._steps_since_meas = 0    # son olcumden kac adim gecti
 
         # None = kapı kapalı (eski davranış); dict = AF_DEFAULTS üstüne yazılır, ör. {} veya {"vtol": 0.3}
-        self.align_cfg = None if align_cfg is None else {**AF_DEFAULTS, **align_cfg}
-        self._af_hold = False
+        self._gate = None if align_cfg is None else DescentGate(align_cfg)
+        self.align_cfg = None if self._gate is None else self._gate.cfg
         self._af_hold_steps = 0
         self.T_LAND = 8.0     # güdüm çizelgesi (bölüm süresinden BAĞIMSIZ)
 
@@ -385,7 +376,8 @@ class LandingAviary(BaseRLAviary):
         # IMM (randomize edilmiş freq ile) + klasik taban, IMM artık doğru (rastgele) freq'i alıyor.
         self._imm  = PlatformIMM(dt=self.CTRL_TIMESTEP, wave_hz=self.plat_freq, meas_var=self.meas_std**2)
         self._guid = LandingGuidance(t_land=self.T_LAND)     # eskiden EPISODE_LEN_SEC
-        self._af_hold = False
+        if self._gate is not None:
+            self._gate.reset()
         self._af_hold_steps = 0
         self._guid.reset_schedule()
         self._cbf = VerticalContactCBF(look=self._guid.lookahead, dt=self.CTRL_TIMESTEP)
@@ -463,27 +455,7 @@ class LandingAviary(BaseRLAviary):
                                                 p.getQuaternionFromEuler([0, 0, 0]),
                                                 physicsClientId=self.CLIENT)
 
-    def _descent_gate(self, drone_pos, drone_vel):
-        """Önce hizalan, sonra in (PX4 precland yatay yaklaşma + NimbRo görüş konisi mantığı).
-        True → bekle (irtifa tut, yatayda pad'e git); False → alçal. Histerezisli."""
-        c = self.align_cfg
-        pe, ve = self.plat_pos_est, self.plat_vel_est
-        h = drone_pos[2] - pe[2]
-        if h < c["commit_h"]:                     # son santimler: iptal yok
-            self._af_hold = False
-            return False
-        horiz = np.linalg.norm(pe[0:2] - drone_pos[0:2])
-        vrel  = np.linalg.norm(ve[0:2] - drone_vel[0:2])
-        tol   = c["r0"] + c["k"] * h
-        vtol  = c["vtol"]
-        stale = self._steps_since_meas > c["stale_max"]
-        if self._af_hold:    # bekliyor → tam hizalanınca bırak
-            ok = (horiz < tol) and (vtol is None or vrel < vtol) and not stale
-            self._af_hold = not ok
-        else:                # alçalıyor → belirgin bozulunca dur (1.3× histerezis, titreşmesin)
-            bad = (horiz > 1.3 * tol) or (vtol is not None and vrel > 1.3 * vtol) or stale
-            self._af_hold = bad
-        return self._af_hold
+
     
     def _computeInfo(self):
         r_rel, v_rel = self._relative_state()
@@ -560,7 +532,8 @@ class LandingAviary(BaseRLAviary):
             drone_pos, drone_vel = state[0:3], state[10:13]
 
             if self.use_residual:
-                hold = self._descent_gate(drone_pos, drone_vel) if self.align_cfg is not None else False
+                hold = (self._gate.step(drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est,
+                                        self._steps_since_meas) if self._gate is not None else False)
                 target_base, phase = self._guid.position_command(
                     drone_pos, drone_vel, self.plat_pos_est, self.plat_vel_est, dt, hold=hold)
                 target_pos = target_base + self.RES_SCALE * action[k, :]   # taban + residual (RL aynen)

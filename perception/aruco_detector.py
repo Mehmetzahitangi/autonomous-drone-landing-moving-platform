@@ -26,6 +26,7 @@ import numpy as np
 import pybullet as p
 import cv2
 from perception.tag_layout import APRILTAG_DICT, TAGS
+from perception.tag_pose import make_detector, detect_tags, solve_pad
 
 
 # ----------------------------- kamera konfigürasyonları -----------------------------
@@ -78,18 +79,10 @@ def cam_config(cfg=None):
     return out
 
 
-def _objp(size):
-    h = size / 2.0
-    return np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], dtype=np.float64)
-
 
 def _small_rot(rvec):
     return cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))[0]
 
-
-def _rotz(yaw):
-    c, s = np.cos(yaw), np.sin(yaw)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 class ArucoCamera:
@@ -110,17 +103,7 @@ class ArucoCamera:
         self.K = np.array([[self.f, 0, self.W/2.0], [0, self.f, self.H/2.0], [0, 0, 1.0]], dtype=np.float64)
         self.dist = np.zeros(5, dtype=np.float64)
 
-        d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, APRILTAG_DICT))
-        prm = cv2.aruco.DetectorParameters()
-        prm.cornerRefinementMethod = {"none": cv2.aruco.CORNER_REFINE_NONE,
-                                      "subpix": cv2.aruco.CORNER_REFINE_SUBPIX,
-                                      "apriltag": cv2.aruco.CORNER_REFINE_APRILTAG}[self.cfg["corner_refine"]]
-        self.detector = cv2.aruco.ArucoDetector(d, prm)
-
-        # her tag için: köşe modeli + pad-merkezine ofset (PAD çerçevesinde)
-        self.objp   = {tid: _objp(cfg_["size"]) for tid, cfg_ in TAGS.items()}
-        self.offset = {tid: np.array([cfg_["offset"][0], cfg_["offset"][1], 0.0]) for tid, cfg_ in TAGS.items()}
-        self.size   = {tid: cfg_["size"] for tid, cfg_ in TAGS.items()}
+        self.detector = make_detector(self.cfg["corner_refine"])
 
         self.proj = p.computeProjectionMatrixFOV(self.vfov, 1.0, 0.05, 10.0, physicsClientId=client)
 
@@ -193,46 +176,18 @@ class ArucoCamera:
         if c["degrade"]:
             gray, smear = self._degrade(gray, eye)
         self.last_frame = gray
-        corners, ids, _ = self.detector.detectMarkers(gray)
+        corners, ids = detect_tags(gray, self.detector)
         if ids is None:
             return None
-
-        # Kamera→dünya dönüşümü TAHMİNİ tutumla (IMU sapma + gürültü)
+        # Kamera==> dünya dönüşümü TAHMİNİ tutumla (IMU sapma + gürültü) — rastgele sayı sırası eskisiyle aynı
         R_est = R_true @ self.R_att_bias @ _small_rot(self.rng.normal(0.0, np.radians(c["att_noise_deg"]), 3))
         eye_est, f_e, u_e = self._axes(pos, R_est)
         M_cw = self._cam_to_world(f_e, u_e)
-
-        per_tag = {}
-        for k, tid in enumerate(ids.ravel().tolist()):
-            if tid not in TAGS:
-                continue
-            img_pts = corners[k].reshape(4, 2).astype(np.float64)
-            ok, rvec, tvec = cv2.solvePnP(self.objp[tid], img_pts, self.K, self.dist,
-                                          flags=cv2.SOLVEPNP_IPPE_SQUARE)
-            if not ok:
-                continue
-            t_w = M_cw @ tvec.ravel()                          # tag merkezi − kamera (dünya eks.)
-            X_w = M_cw @ _small_rot(rvec)[:, 0]                # tag x-ekseni (dünya)
-            yaw = float(np.arctan2(X_w[1], X_w[0]))            # pad yönü (tag ekseni = pad ekseni)
-            rel = t_w - _rotz(yaw) @ self.offset[tid]          # pad merkezi − kamera
-            if not np.all(np.isfinite(rel)):
-                continue
-            px = float(np.mean(np.linalg.norm(img_pts - np.roll(img_pts, 1, axis=0), axis=1)))
-            per_tag[tid] = dict(rel=rel, px=px, yaw=yaw)
-
-        if not per_tag:
+        out = solve_pad(corners, ids, self.K, self.dist, M_cw, eye_est)
+        if out is None:
             return None
-        best = max(per_tag, key=lambda t: per_tag[t]["px"])   # en çok pikselli tag en doğru
-        b = per_tag[best]
-        return dict(z=eye_est + b["rel"], rel=b["rel"], tid=best, px=b["px"], yaw=b["yaw"],
-                    tags={t: eye_est + v["rel"] for t, v in per_tag.items()}, smear=smear)
-
-    def sense(self, return_tags=False):
-        """Geriye-uyum: pad merkezinin dünya tahmini (3,) ya da None."""
-        m = self.measure()
-        if m is None:
-            return (None, {}) if return_tags else None
-        return (m["z"], m["tags"]) if return_tags else m["z"]
+        out["smear"] = smear
+        return out
 
 
 # --------------------- öz-test ---------------------
